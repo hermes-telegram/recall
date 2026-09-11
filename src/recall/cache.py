@@ -302,29 +302,70 @@ class DiskBackend(CacheBackend):
 
 
 class RedisBackend(CacheBackend):
-    """Redis cache backend."""
+    """Redis cache backend with connection pooling and retry logic."""
 
     def __init__(
         self,
         url: str = "redis://localhost:6379",
         prefix: str = "recall:",
         compression: bool = False,
+        max_connections: int = 10,
+        socket_timeout: float = 5.0,
+        socket_connect_timeout: float = 5.0,
+        retry_on_timeout: bool = True,
+        max_retries: int = 3,
+        retry_delay: float = 0.1,
     ):
         import redis
-        self.client = redis.from_url(url)
+        from redis.connection import ConnectionPool
+
         self.prefix = prefix
         self.compression = compression
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+
+        pool = ConnectionPool.from_url(
+            url,
+            max_connections=max_connections,
+            socket_timeout=socket_timeout,
+            socket_connect_timeout=socket_connect_timeout,
+            retry_on_timeout=retry_on_timeout,
+        )
+        self.client = redis.Redis(connection_pool=pool)
+        self._lock = threading.Lock()
+
+        # Test connection
+        try:
+            self.client.ping()
+        except Exception as e:
+            raise ConnectionError(f"Redis connection failed: {e}")
 
     def _key(self, key: str) -> str:
         return f"{self.prefix}{key}"
 
+    def _execute_with_retry(self, func, *args, **kwargs):
+        """Execute Redis operation with retry logic."""
+        last_error = None
+        for attempt in range(self.max_retries):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                last_error = e
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay * (2 ** attempt))
+                else:
+                    raise last_error
+
     def get(self, key: str) -> Optional[tuple[float, Any]]:
-        raw = self.client.get(self._key(key))
-        if raw:
-            data = pickle.loads(raw)
-            if self.compression:
-                return (data[0], pickle.loads(zlib.decompress(data[1])))
-            return data
+        try:
+            raw = self._execute_with_retry(self.client.get, self._key(key))
+            if raw:
+                data = pickle.loads(raw)
+                if self.compression:
+                    return (data[0], pickle.loads(zlib.decompress(data[1])))
+                return data
+        except Exception:
+            pass
         return None
 
     def set(self, key: str, value: Any, ttl: float) -> None:
@@ -332,52 +373,88 @@ class RedisBackend(CacheBackend):
             data = pickle.dumps((time.time() + ttl, zlib.compress(pickle.dumps(value))))
         else:
             data = pickle.dumps((time.time() + ttl, value))
-        self.client.setex(self._key(key), int(ttl), data)
+        self._execute_with_retry(self.client.setex, self._key(key), int(ttl), data)
 
     def delete(self, key: str) -> None:
-        self.client.delete(self._key(key))
+        self._execute_with_retry(self.client.delete, self._key(key))
 
     def clear(self) -> None:
-        keys = self.client.keys(f"{self.prefix}*")
-        if keys:
-            self.client.delete(*keys)
+        """Clear using SCAN to avoid blocking Redis."""
+        cursor = 0
+        while True:
+            cursor, keys = self.client.scan(cursor, match=f"{self.prefix}*", count=100)
+            if keys:
+                self._execute_with_retry(self.client.delete, *keys)
+            if cursor == 0:
+                break
 
     def get_many(self, keys: List[str]) -> Dict[str, tuple[float, Any]]:
-        pipe = self.client.pipeline()
-        for key in keys:
-            pipe.get(self._key(key))
-        results = {}
-        for key, raw in zip(keys, pipe.execute()):
-            if raw:
-                results[key] = pickle.loads(raw)
-        return results
+        if not keys:
+            return {}
+        try:
+            pipe = self.client.pipeline()
+            for key in keys:
+                pipe.get(self._key(key))
+            results = {}
+            for key, raw in zip(keys, pipe.execute()):
+                if raw:
+                    results[key] = pickle.loads(raw)
+            return results
+        except Exception:
+            return {}
 
     def set_many(self, items: Dict[str, Any], ttl: float) -> None:
-        pipe = self.client.pipeline()
-        for key, value in items.items():
-            if self.compression:
-                data = pickle.dumps((time.time() + ttl, zlib.compress(pickle.dumps(value))))
-            else:
-                data = pickle.dumps((time.time() + ttl, value))
-            pipe.setex(self._key(key), int(ttl), data)
-        pipe.execute()
+        if not items:
+            return
+        try:
+            pipe = self.client.pipeline()
+            for key, value in items.items():
+                if self.compression:
+                    data = pickle.dumps((time.time() + ttl, zlib.compress(pickle.dumps(value))))
+                else:
+                    data = pickle.dumps((time.time() + ttl, value))
+                pipe.setex(self._key(key), int(ttl), data)
+            pipe.execute()
+        except Exception:
+            pass
 
     def delete_many(self, keys: List[str]) -> None:
-        pipe = self.client.pipeline()
-        for key in keys:
-            pipe.delete(self._key(key))
-        pipe.execute()
+        if not keys:
+            return
+        try:
+            pipe = self.client.pipeline()
+            for key in keys:
+                pipe.delete(self._key(key))
+            pipe.execute()
+        except Exception:
+            pass
 
     def keys(self) -> List[str]:
         prefix_len = len(self.prefix)
-        return [k.decode()[prefix_len:] for k in self.client.keys(f"{self.prefix}*")]
+        result = []
+        try:
+            cursor = 0
+            while True:
+                cursor, keys = self.client.scan(cursor, match=f"{self.prefix}*", count=100)
+                result.extend(k.decode()[prefix_len:] for k in keys)
+                if cursor == 0:
+                    break
+        except Exception:
+            pass
+        return result
 
     def health(self) -> dict:
         try:
             self.client.ping()
-            return {"status": "healthy", "type": "redis"}
-        except:
-            return {"status": "unhealthy", "type": "redis"}
+            info = self.client.info("server")
+            return {
+                "status": "healthy",
+                "type": "redis",
+                "version": info.get("redis_version", "unknown"),
+                "uptime": info.get("uptime_in_seconds", 0),
+            }
+        except Exception as e:
+            return {"status": "unhealthy", "type": "redis", "error": str(e)}
 
 
 class CacheStats:
