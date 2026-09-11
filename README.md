@@ -17,6 +17,16 @@ def get_user(user_id):
 - **TTL shorthand** — `"30m"`, `"1h"`, `"7d"` instead of raw seconds
 - **LRU eviction** — automatic cleanup when maxsize is reached
 - **Thread-safe** — works in concurrent environments
+- **Async support** — full async/await compatibility
+- **Cache statistics** — track hit/miss rates
+- **Stampede protection** — prevent cache stampede
+- **Background refresh** — auto-refresh before expiry
+- **Compression** — zlib compression for large values
+- **Bulk operations** — get_many, set_many, delete_many
+- **Serialization** — pickle, JSON, msgpack
+- **Namespacing** — key prefix and versioning
+- **Cache warming** — pre-populate cache
+- **Sliding TTL** — reset TTL on each access
 - **Zero dependencies** — Redis backend optional
 
 ## Install
@@ -84,10 +94,117 @@ expensive_func.cache_clear()
 # Delete specific key
 expensive_func.cache_delete(42)
 
-# Custom key function
-@cache(ttl="1h", key_fn=lambda f, a, k: f"{a}_{k.get('mode', '')}")
-def custom(data, mode):
+# Get without computing
+result = expensive_func.cache_get(42)
+
+# Set manually
+expensive_func.cache_set(99, 42)
+
+# Pre-populate cache
+expensive_func.cache_warm([(1,), (2,), (3,)])
+
+# Get cache statistics
+stats = expensive_func.cache_stats
+print(stats.hits, stats.misses, stats.hit_rate)
+
+# Get all keys
+keys = expensive_func.cache_keys()
+
+# Backend health check
+health = expensive_func.cache_health()
+```
+
+## Bulk Operations
+
+```python
+# Get multiple keys
+results = expensive_func.cache_get_many(["key1", "key2"])
+
+# Set multiple keys
+expensive_func.cache_set_many({"key1": 1, "key2": 2})
+
+# Delete multiple keys
+expensive_func.cache_delete_many(["key1", "key2"])
+```
+
+## Advanced Features
+
+### Sliding TTL (reset on access)
+
+```python
+@cache(ttl="5m", sliding=True)
+def get_session(session_id):
+    return db.query(session_id)
+```
+
+### Cache Versioning
+
+```python
+@cache(ttl="1h", version="2")  # Change to invalidate all
+def get_data(key):
+    return fetch(key)
+```
+
+### Stampede Protection
+
+```python
+@cache(ttl="1h", stampede_protection=True)
+def expensive_computation(x):
+    return x ** x
+```
+
+### Background Refresh
+
+```python
+@cache(ttl="1h", background_refresh=300)  # Refresh 5min before expiry
+def get_config():
+    return fetch_config()
+```
+
+### Compression
+
+```python
+@cache(ttl="1h", compression=True)
+def get_large_data():
+    return list(range(100000))
+```
+
+### Custom Key Function
+
+```python
+@cache(ttl="1h", key_fn=lambda f, a, k: f"{a[0]}_{k.get('mode', '')}")
+def process(data, mode="default"):
     return f"{data}_{mode}"
+```
+
+### Key Prefix (Namespacing)
+
+```python
+@cache(ttl="1h", prefix="myapp")
+def get_user(user_id):
+    return db.query(user_id)
+```
+
+### Serialization Format
+
+```python
+@cache(ttl="1h", serializer="json")  # pickle, json, msgpack
+def get_data():
+    return {"key": "value"}
+```
+
+## Async Support
+
+```python
+@cache(ttl="1h")
+async def get_user_async(user_id):
+    return await db.query(user_id)
+
+# Works with async functions
+result = await get_user_async(1)
+
+# Cache warming in async
+await get_user_async.cache_warm([(1,), (2,)])
 ```
 
 ## TTL Formats
@@ -115,9 +232,3 @@ def custom(data, mode):
 ## License
 
 MIT
-# trigger
-
-# trigger
-# trigger
-# trigger
-# trigger

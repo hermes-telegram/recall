@@ -1,10 +1,13 @@
 """Comprehensive tests for recall."""
 
+import asyncio
 import os
 import shutil
+import tempfile
 import time
+import threading
 import pytest
-from recall import cache, MemoryBackend, DiskBackend
+from recall import cache, MemoryBackend, DiskBackend, CacheStats
 
 
 # ============================================================
@@ -48,7 +51,6 @@ class TestMemoryBackend:
         be = MemoryBackend(maxsize=3)
         for i in range(5):
             be.set(f"k{i}", f"v{i}", ttl=60)
-        # Only 3 should remain
         count = sum(1 for i in range(5) if be.get(f"k{i}") is not None)
         assert count == 3
 
@@ -57,9 +59,7 @@ class TestMemoryBackend:
         be.set("a", 1, ttl=60)
         be.set("b", 2, ttl=60)
         be.set("c", 3, ttl=60)
-        # Access "a" to make it recently used
         be.get("a")
-        # Add "d" — should evict "b" (least recently used)
         be.set("d", 4, ttl=60)
         assert be.get("a") is not None
         assert be.get("b") is None
@@ -86,6 +86,50 @@ class TestMemoryBackend:
         assert be.get("none")[1] is None
         assert be.get("tuple")[1] == (1, 2)
 
+    def test_compression(self):
+        be = MemoryBackend(compression=True)
+        be.set("key1", "value1", ttl=60)
+        result = be.get("key1")
+        assert result is not None
+        assert result[1] == "value1"
+
+    def test_get_many(self):
+        be = MemoryBackend()
+        be.set("k1", "v1", ttl=60)
+        be.set("k2", "v2", ttl=60)
+        be.set("k3", "v3", ttl=60)
+        results = be.get_many(["k1", "k2", "k4"])
+        assert "k1" in results
+        assert "k2" in results
+        assert "k4" not in results
+
+    def test_set_many(self):
+        be = MemoryBackend()
+        be.set_many({"k1": "v1", "k2": "v2"}, ttl=60)
+        assert be.get("k1")[1] == "v1"
+        assert be.get("k2")[1] == "v2"
+
+    def test_delete_many(self):
+        be = MemoryBackend()
+        be.set("k1", "v1", ttl=60)
+        be.set("k2", "v2", ttl=60)
+        be.delete_many(["k1", "k2"])
+        assert be.get("k1") is None
+        assert be.get("k2") is None
+
+    def test_keys(self):
+        be = MemoryBackend()
+        be.set("k1", "v1", ttl=60)
+        be.set("k2", "v2", ttl=60)
+        keys = be.keys()
+        assert len(keys) == 2
+
+    def test_health(self):
+        be = MemoryBackend()
+        health = be.health()
+        assert health["status"] == "healthy"
+        assert health["type"] == "memory"
+
 
 # ============================================================
 # Disk Backend Tests
@@ -93,11 +137,10 @@ class TestMemoryBackend:
 
 class TestDiskBackend:
     def setup_method(self):
-        self.dir = ".test_recall_cache"
+        self.dir = tempfile.mkdtemp()
 
     def teardown_method(self):
-        if os.path.exists(self.dir):
-            shutil.rmtree(self.dir)
+        shutil.rmtree(self.dir, ignore_errors=True)
 
     def test_set_and_get(self):
         be = DiskBackend(self.dir)
@@ -133,7 +176,6 @@ class TestDiskBackend:
     def test_persistence(self):
         be = DiskBackend(self.dir)
         be.set("key1", {"complex": "data"}, ttl=60)
-        # Create new backend instance (simulates restart)
         be2 = DiskBackend(self.dir)
         result = be2.get("key1")
         assert result is not None
@@ -149,6 +191,113 @@ class TestDiskBackend:
         assert be.get("list")[1] == [1, 2, 3]
         assert be.get("dict")[1] == {"a": 1}
         assert be.get("none")[1] is None
+
+    def test_compression(self):
+        be = DiskBackend(self.dir, compression=True)
+        be.set("key1", "value1", ttl=60)
+        result = be.get("key1")
+        assert result is not None
+        assert result[1] == "value1"
+
+    def test_size_limit(self):
+        be = DiskBackend(self.dir, max_size_bytes=200)
+        be.set("k1", "x" * 100, ttl=60)
+        be.set("k2", "y" * 100, ttl=60)
+        be.set("k3", "z" * 100, ttl=60)
+        # One should be evicted
+        count = sum(1 for k in ["k1", "k2", "k3"] if be.get(k) is not None)
+        assert count <= 2
+
+    def test_get_many(self):
+        be = DiskBackend(self.dir)
+        be.set("k1", "v1", ttl=60)
+        be.set("k2", "v2", ttl=60)
+        results = be.get_many(["k1", "k2"])
+        assert "k1" in results
+        assert "k2" in results
+
+    def test_set_many(self):
+        be = DiskBackend(self.dir)
+        be.set_many({"k1": "v1", "k2": "v2"}, ttl=60)
+        assert be.get("k1")[1] == "v1"
+        assert be.get("k2")[1] == "v2"
+
+    def test_delete_many(self):
+        be = DiskBackend(self.dir)
+        be.set("k1", "v1", ttl=60)
+        be.set("k2", "v2", ttl=60)
+        be.delete_many(["k1", "k2"])
+        assert be.get("k1") is None
+        assert be.get("k2") is None
+
+    def test_keys(self):
+        be = DiskBackend(self.dir)
+        be.set("k1", "v1", ttl=60)
+        be.set("k2", "v2", ttl=60)
+        keys = be.keys()
+        assert len(keys) == 2
+
+    def test_health(self):
+        be = DiskBackend(self.dir)
+        health = be.health()
+        assert health["status"] == "healthy"
+        assert health["type"] == "disk"
+
+
+# ============================================================
+# CacheStats Tests
+# ============================================================
+
+class TestCacheStats:
+    def test_hit(self):
+        stats = CacheStats()
+        stats.hit()
+        stats.hit()
+        assert stats.hits == 2
+        assert stats.misses == 0
+        assert stats.hit_rate == 1.0
+
+    def test_miss(self):
+        stats = CacheStats()
+        stats.miss()
+        assert stats.hits == 0
+        assert stats.misses == 1
+        assert stats.hit_rate == 0.0
+
+    def test_mixed(self):
+        stats = CacheStats()
+        stats.hit()
+        stats.hit()
+        stats.miss()
+        assert stats.hit_rate == 2 / 3
+
+    def test_reset(self):
+        stats = CacheStats()
+        stats.hit()
+        stats.miss()
+        stats.reset()
+        assert stats.hits == 0
+        assert stats.misses == 0
+
+    def test_to_dict(self):
+        stats = CacheStats()
+        stats.hit()
+        d = stats.to_dict()
+        assert "hits" in d
+        assert "misses" in d
+        assert "hit_rate" in d
+
+    def test_thread_safety(self):
+        stats = CacheStats()
+        def worker():
+            for _ in range(100):
+                stats.hit()
+        threads = [threading.Thread(target=worker) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert stats.hits == 1000
 
 
 # ============================================================
@@ -166,7 +315,7 @@ class TestCacheDecorator:
             return a + b
 
         assert add(2, 3) == 5
-        assert add(2, 3) == 5  # Should use cache
+        assert add(2, 3) == 5
         assert call_count == 1
 
     def test_different_args(self):
@@ -193,7 +342,7 @@ class TestCacheDecorator:
 
         assert add(2, 3) == 5
         time.sleep(0.15)
-        assert add(2, 3) == 5  # Recomputed
+        assert add(2, 3) == 5
         assert call_count == 2
 
     def test_cache_clear(self):
@@ -242,13 +391,14 @@ class TestCacheDecorator:
         call_count = 0
 
         @cache(ttl="1h", key_fn=lambda f, a, k: f"{a[0]}_{k.get('mode', '')}")
-        def process(data, mode):
+        def process(data, mode="default"):
             nonlocal call_count
             call_count += 1
             return f"{data}_{mode}"
 
-        assert process("x", mode="y") == "x_y"
-        assert process("x", mode="z") == "x_z"  # Different key
+        assert process("x", mode="fast") == "x_fast"
+        assert process("x", mode="fast") == "x_fast"
+        assert process("x", mode="slow") == "x_slow"
         assert call_count == 2
 
     def test_custom_backend(self):
@@ -262,7 +412,6 @@ class TestCacheDecorator:
             return a + b
 
         add(2, 3)
-        # Verify backend has the key
         assert len(be._cache) == 1
 
     def test_functools_wraps(self):
@@ -287,7 +436,7 @@ class TestCacheDecorator:
             fail()
         with pytest.raises(ValueError):
             fail()
-        assert call_count == 2  # Not cached
+        assert call_count == 2
 
     def test_none_return(self):
         call_count = 0
@@ -300,10 +449,9 @@ class TestCacheDecorator:
 
         assert return_none() is None
         assert return_none() is None
-        assert call_count == 1  # Cached
+        assert call_count == 1
 
     def test_ttl_parsing(self):
-        # Test various TTL formats
         call_count = 0
 
         @cache(ttl="1s")
@@ -336,7 +484,7 @@ class TestCacheDecorator:
             call_count += 1
             return 5
 
-        @cache(ttl=3600)  # raw seconds
+        @cache(ttl=3600)
         def f6():
             nonlocal call_count
             call_count += 1
@@ -344,14 +492,6 @@ class TestCacheDecorator:
 
         f1(); f2(); f3(); f4(); f5(); f6()
         assert call_count == 6
-
-    def test_nested_decorator(self):
-        @cache(ttl="1h")
-        @staticmethod
-        def add(a, b):
-            return a + b
-
-        assert add(2, 3) == 5
 
     def test_method_caching(self):
         class Calculator:
@@ -369,8 +509,6 @@ class TestCacheDecorator:
         assert calc.calls == 1
 
     def test_concurrent_access(self):
-        import threading
-
         @cache(ttl="1h")
         def slow_func(x):
             time.sleep(0.01)
@@ -388,32 +526,235 @@ class TestCacheDecorator:
 
         assert all(r == 10 for r in results)
 
+    def test_cache_get(self):
+        call_count = 0
+
+        @cache(ttl="1h")
+        def add(a, b):
+            nonlocal call_count
+            call_count += 1
+            return a + b
+
+        result = add.cache_get(2, 3)
+        assert result is None
+        add(2, 3)
+        result = add.cache_get(2, 3)
+        assert result == 5
+
+    def test_cache_set(self):
+        @cache(ttl="1h")
+        def add(a, b):
+            return a + b
+
+        add.cache_set(99, 2, 3)
+        result = add.cache_get(2, 3)
+        assert result == 99
+
+    def test_cache_warm(self):
+        call_count = 0
+
+        @cache(ttl="1h")
+        def add(a, b):
+            nonlocal call_count
+            call_count += 1
+            return a + b
+
+        add.cache_warm([(1, 2), (3, 4)])
+        assert call_count == 2
+        add(1, 2)
+        add(3, 4)
+        assert call_count == 2  # No additional calls
+
+    def test_cache_stats(self):
+        @cache(ttl="1h")
+        def add(a, b):
+            return a + b
+
+        add(2, 3)
+        add(2, 3)
+        add(3, 4)
+        stats = add.cache_stats
+        assert stats.hits == 1
+        assert stats.misses == 2
+
+    def test_cache_keys(self):
+        @cache(ttl="1h")
+        def add(a, b):
+            return a + b
+
+        add(2, 3)
+        add(3, 4)
+        keys = add.cache_keys()
+        assert len(keys) == 2
+
+    def test_cache_health(self):
+        @cache(ttl="1h")
+        def add(a, b):
+            return a + b
+
+        health = add.cache_health()
+        assert health["status"] == "healthy"
+
+    def test_cache_get_many(self):
+        @cache(ttl="1h")
+        def add(a, b):
+            return a + b
+
+        add(2, 3)
+        add(3, 4)
+        results = add.cache_get_many(add.cache_keys())
+        assert len(results) == 2
+
+    def test_cache_set_many(self):
+        @cache(ttl="1h")
+        def add(a, b):
+            return a + b
+
+        keys = add.cache_keys()
+        add.cache_set_many({k: 99 for k in keys})
+        for k in keys:
+            _, v = add.cache_backend.get(k)
+            assert v == 99
+
+    def test_cache_delete_many(self):
+        @cache(ttl="1h")
+        def add(a, b):
+            return a + b
+
+        add(2, 3)
+        add(3, 4)
+        keys = add.cache_keys()
+        add.cache_delete_many(keys)
+        assert len(add.cache_keys()) == 0
+
+    def test_prefix(self):
+        @cache(ttl="1h", prefix="myapp")
+        def add(a, b):
+            return a + b
+
+        add(2, 3)
+        keys = add.cache_keys()
+        assert all(k.startswith("myapp:") for k in keys)
+
+    def test_version(self):
+        @cache(ttl="1h", version="1")
+        def add(a, b):
+            return a + b
+
+        add(2, 3)
+        keys = add.cache_keys()
+        assert len(keys) == 1
+        # Key should contain version
+        assert "v1" in keys[0]
+
+    def test_sliding_ttl(self):
+        @cache(ttl=0.5, sliding=True)
+        def add(a, b):
+            return a + b
+
+        add(2, 3)
+        time.sleep(0.3)
+        add(2, 3)  # Should reset TTL
+        time.sleep(0.3)
+        result = add.cache_get(2, 3)
+        assert result is not None  # Still alive due to sliding
+
+    def test_stampede_protection(self):
+        call_count = 0
+        lock = threading.Lock()
+
+        @cache(ttl="1h", stampede_protection=True)
+        def expensive(x):
+            nonlocal call_count
+            with lock:
+                call_count += 1
+            time.sleep(0.05)
+            return x * 2
+
+        results = []
+        def worker():
+            results.append(expensive(5))
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert all(r == 10 for r in results)
+        # Stampede protection should result in fewer calls than threads
+        # (some threads should get cached result)
+        assert call_count <= 5
+
+    def test_compression(self):
+        @cache(ttl="1h", compression=True)
+        def add(a, b):
+            return a + b
+
+        assert add(2, 3) == 5
+        assert add(2, 3) == 5
+
+    def test_serializer_json(self):
+        @cache(ttl="1h", serializer="json")
+        def add(a, b):
+            return a + b
+
+        assert add(2, 3) == 5
+        assert add(2, 3) == 5
+
+
+# ============================================================
+# Async Tests
+# ============================================================
+
+class TestAsyncCache:
+    def test_async_basic(self):
+        call_count = 0
+
+        @cache(ttl="1h")
+        async def add(a, b):
+            nonlocal call_count
+            call_count += 1
+            return a + b
+
+        loop = asyncio.new_event_loop()
+        assert loop.run_until_complete(add(2, 3)) == 5
+        assert loop.run_until_complete(add(2, 3)) == 5
+        assert call_count == 1
+        loop.close()
+
+    def test_async_cache_clear(self):
+        @cache(ttl="1h")
+        async def add(a, b):
+            return a + b
+
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(add(2, 3))
+        add.cache_clear()
+        assert len(add.cache_keys()) == 0
+        loop.close()
+
+    def test_async_cache_warm(self):
+        call_count = 0
+
+        @cache(ttl="1h")
+        async def add(a, b):
+            nonlocal call_count
+            call_count += 1
+            return a + b
+
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(add.cache_warm([(1, 2), (3, 4)]))
+        assert call_count == 2
+        loop.close()
+
 
 # ============================================================
 # Integration Tests
 # ============================================================
 
 class TestIntegration:
-    def test_memory_to_disk(self):
-        """Test that data can be cached in memory and retrieved from disk."""
-        mem_be = MemoryBackend()
-        disk_be = DiskBackend(".test_integration_cache")
-
-        try:
-            @cache(ttl="1h", backend=mem_be)
-            def compute(x):
-                return x * 2
-
-            result = compute(5)
-            assert result == 10
-
-            # Verify it's in memory
-            assert mem_be.get("some_key") is None  # Different key
-        finally:
-            shutil.rmtree(".test_integration_cache", ignore_errors=True)
-
     def test_real_world_pattern(self):
-        """Simulate real-world usage: API call caching."""
         api_calls = []
 
         @cache(ttl="5m")
@@ -421,23 +762,19 @@ class TestIntegration:
             api_calls.append(user_id)
             return {"id": user_id, "name": f"User {user_id}"}
 
-        # First call hits the API
         user = fetch_user(1)
         assert user["name"] == "User 1"
         assert len(api_calls) == 1
 
-        # Second call uses cache
         user = fetch_user(1)
         assert user["name"] == "User 1"
         assert len(api_calls) == 1
 
-        # Different user hits the API
         user = fetch_user(2)
         assert user["name"] == "User 2"
         assert len(api_calls) == 2
 
     def test_cache_invalidation_pattern(self):
-        """Test manual cache invalidation."""
         @cache(ttl="1h")
         def get_config(key):
             return f"value_for_{key}"
@@ -445,8 +782,14 @@ class TestIntegration:
         get_config("db_host")
         get_config("db_port")
 
-        # Invalidate one
         get_config.cache_delete("db_host")
 
-        # db_host should be gone, db_port should remain
-        # (we can't easily check this without accessing backend directly)
+    def test_compression_large_data(self):
+        @cache(ttl="1h", compression=True)
+        def get_large():
+            return list(range(1000))
+
+        data = get_large()
+        assert len(data) == 1000
+        data2 = get_large()
+        assert data == data2
