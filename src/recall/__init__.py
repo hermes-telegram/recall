@@ -52,6 +52,30 @@ from .warming import WarmingScheduler
 # Plugins
 from .plugins import FastAPICache
 
+# Advanced patterns (20 enterprise features)
+from .advanced import (
+    RequestCoalescer,
+    ProbabilisticEarlyExpiration,
+    NegativeCache,
+    CachePatterns,
+    DependencyInvalidator,
+    TransactionIntegration,
+    SchemaVersioning,
+    HTTPCache,
+    CacheControl,
+    AdaptiveTTL,
+    HotKeyDetector,
+    LargeKeyDetector,
+    CompressionRatioMonitoring,
+    MemoryFragmentationTracker,
+    StaleDataDetector,
+    StartupWarmer,
+    GracefulDegradation,
+    IdempotencyKeySupport,
+    RequestDeduplication,
+    CacheEfficiencyTracker,
+)
+
 __all__ = [
     "cache",
     "CacheBackend",
@@ -78,5 +102,25 @@ __all__ = [
     "TenantBackend",
     "WarmingScheduler",
     "FastAPICache",
+    "RequestCoalescer",
+    "ProbabilisticEarlyExpiration",
+    "NegativeCache",
+    "CachePatterns",
+    "DependencyInvalidator",
+    "TransactionIntegration",
+    "SchemaVersioning",
+    "HTTPCache",
+    "CacheControl",
+    "AdaptiveTTL",
+    "HotKeyDetector",
+    "LargeKeyDetector",
+    "CompressionRatioMonitoring",
+    "MemoryFragmentationTracker",
+    "StaleDataDetector",
+    "StartupWarmer",
+    "GracefulDegradation",
+    "IdempotencyKeySupport",
+    "RequestDeduplication",
+    "CacheEfficiencyTracker",
 ]
-__version__ = "1.0.0"
+__version__ = "2.0.0"
