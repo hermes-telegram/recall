@@ -23,7 +23,8 @@ dependencies = []
 [project.optional-dependencies]
 redis = ["redis>=4.0"]
 msgpack = ["msgpack>=1.0"]
-dev = ["pytest", "redis", "msgpack"]
+crypto = ["cryptography>=41.0"]
+dev = ["pytest", "redis", "msgpack", "cryptography"]
 
 [project.urls]
 Homepage = "https://github.com/hermes-telegram/recall"
