@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "recall"
+name = "recall-cache"
 version = "0.1.0"
 description = "Smart caching for any function — simple as requests"
 readme = "README.md"
