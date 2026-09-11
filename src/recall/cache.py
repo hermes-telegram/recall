@@ -208,9 +208,12 @@ def cache(
         # Attach cache management methods
         wrapper.cache_backend = backend
         wrapper.cache_clear = backend.clear
-        wrapper.cache_delete = lambda *a, **kw: backend.delete(
-            key_fn(func, a, kw) if key_fn else _make_key(func, a, kw)
-        )
+
+        def _cache_delete(*a, **kw):
+            k = key_fn(func, a, kw) if key_fn else _make_key(func, a, kw)
+            backend.delete(k)
+
+        wrapper.cache_delete = _cache_delete
 
         return wrapper
 
