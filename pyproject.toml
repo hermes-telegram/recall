@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "recall-cache"
-version = "0.3.2"
+version = "0.4.0"
 description = "Smart caching for any function — simple as requests"
 readme = "README.md"
 license = { text = "MIT" }

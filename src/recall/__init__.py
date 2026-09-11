@@ -6,6 +6,7 @@ from .cache import (
     MemoryBackend,
     DiskBackend,
     RedisBackend,
+    MultiTierBackend,
     CacheStats,
 )
 
@@ -15,6 +16,7 @@ __all__ = [
     "MemoryBackend",
     "DiskBackend",
     "RedisBackend",
+    "MultiTierBackend",
     "CacheStats",
 ]
-__version__ = "0.3.0"
+__version__ = "0.4.0"

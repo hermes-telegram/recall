@@ -4,9 +4,11 @@ import asyncio
 import base64
 import functools
 import hashlib
+import hmac
 import json
 import os
 import pickle
+import secrets
 import threading
 import time
 import zlib
@@ -159,11 +161,13 @@ class DiskBackend(CacheBackend):
         directory: str = ".recall_cache",
         compression: bool = False,
         max_size_bytes: Optional[int] = None,
+        encryption_key: Optional[str] = None,
     ):
         self.directory = directory
         self.compression = compression
         self.max_size_bytes = max_size_bytes
         self._lock = threading.Lock()
+        self.encryption_key = encryption_key
         os.makedirs(directory, exist_ok=True)
 
     def _path(self, key: str) -> str:
@@ -174,13 +178,34 @@ class DiskBackend(CacheBackend):
         safe = hashlib.sha256(key.encode()).hexdigest()[:16]
         return os.path.join(self.directory, f"{safe}.meta")
 
+    def _encrypt(self, data: bytes) -> bytes:
+        """Encrypt data with AES-256-GCM."""
+        if not self.encryption_key:
+            return data
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        key = hashlib.sha256(self.encryption_key.encode()).digest()
+        nonce = secrets.token_bytes(12)
+        aesgcm = AESGCM(key)
+        return nonce + aesgcm.encrypt(nonce, data, None)
+
+    def _decrypt(self, data: bytes) -> bytes:
+        """Decrypt data with AES-256-GCM."""
+        if not self.encryption_key:
+            return data
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        key = hashlib.sha256(self.encryption_key.encode()).digest()
+        nonce = data[:12]
+        aesgcm = AESGCM(key)
+        return aesgcm.decrypt(nonce, data[12:], None)
+
     def get(self, key: str) -> Optional[tuple[float, Any]]:
         with self._lock:
             path = self._path(key)
             if os.path.exists(path):
                 try:
                     with open(path, "rb") as f:
-                        expire_time, value = pickle.load(f)
+                        raw = self._decrypt(f.read())
+                        expire_time, value = pickle.loads(raw)
                     if expire_time > time.time():
                         if self.compression:
                             return (expire_time, pickle.loads(zlib.decompress(value)))
@@ -189,7 +214,7 @@ class DiskBackend(CacheBackend):
                         os.remove(path)
                         if os.path.exists(self._meta_path(key)):
                             os.remove(self._meta_path(key))
-                except (pickle.PickleError, OSError):
+                except (pickle.PickleError, OSError, Exception):
                     pass
         return None
 
@@ -201,7 +226,7 @@ class DiskBackend(CacheBackend):
             else:
                 data = pickle.dumps((time.time() + ttl, value))
             with open(path, "wb") as f:
-                f.write(data)
+                f.write(self._encrypt(data))
 
             # Track size
             meta_path = self._meta_path(key)
@@ -251,7 +276,8 @@ class DiskBackend(CacheBackend):
                     path = os.path.join(self.directory, f)
                     try:
                         with open(path, "rb") as fh:
-                            expire_time, _ = pickle.load(fh)
+                            raw = self._decrypt(fh.read())
+                            expire_time, _ = pickle.loads(raw)
                         if expire_time > now:
                             result.append(f[:-6])  # Remove .cache
                     except:
@@ -320,24 +346,6 @@ class RedisBackend(CacheBackend):
         db: int = 0,
         cluster_mode: bool = False,
     ):
-        """
-        Initialize Redis backend.
-
-        Args:
-            url: Redis URL (redis://, rediss://, unix://)
-            prefix: Key prefix for namespacing
-            compression: Compress values with zlib
-            max_connections: Max connections in pool
-            socket_timeout: Socket timeout in seconds
-            socket_connect_timeout: Connection timeout in seconds
-            retry_on_timeout: Retry on timeout errors
-            max_retries: Max retry attempts
-            retry_delay: Initial retry delay (exponential backoff)
-            serializer: Serialization format (pickle, json, msgpack)
-            key_hash: Hash long keys with SHA256
-            db: Redis database number (standalone only)
-            cluster_mode: Enable Redis Cluster mode
-        """
         self.prefix = prefix
         self.compression = compression
         self.max_retries = max_retries
@@ -347,13 +355,11 @@ class RedisBackend(CacheBackend):
 
         if cluster_mode:
             from rediscluster import RedisCluster
-
             startup_nodes = [{"host": url.split(":")[1].split("@")[-1], "port": int(url.split(":")[-1].split("/")[0])}]
             self.client = RedisCluster(startup_nodes=startup_nodes, decode_responses=False)
         else:
             import redis
             from redis.connection import ConnectionPool
-
             pool = ConnectionPool.from_url(
                 url,
                 max_connections=max_connections,
@@ -535,6 +541,143 @@ class RedisBackend(CacheBackend):
             return {"status": "unhealthy", "type": "redis", "error": str(e)}
 
 
+class MultiTierBackend(CacheBackend):
+    """
+    Multi-tier caching: L1 (Memory) → L2 (Disk/Redis) with automatic fallback.
+    
+    When L2 is unavailable, automatically falls back to L1.
+    Supports TTL jitter to prevent thundering herd.
+    """
+
+    def __init__(
+        self,
+        l1: Optional[MemoryBackend] = None,
+        l2: Optional[CacheBackend] = None,
+        jitter: bool = False,
+        jitter_max_percent: int = 10,
+    ):
+        """
+        Args:
+            l1: L1 cache (Memory)
+            l2: L2 cache (Disk or Redis)
+            jitter: Enable TTL jitter to prevent thundering herd
+            jitter_max_percent: Max jitter percentage (0-100)
+        """
+        self.l1 = l1 or MemoryBackend()
+        self.l2 = l2
+        self.jitter = jitter
+        self.jitter_max_percent = jitter_max_percent
+        self._l2_healthy = True
+        self._l2_fail_count = 0
+        self._l2_max_failures = 5
+        self._lock = threading.Lock()
+
+    def _apply_jitter(self, ttl: float) -> float:
+        """Apply random jitter to TTL."""
+        if not self.jitter or self.jitter_max_percent <= 0:
+            return ttl
+        import random
+        jitter_range = ttl * (self.jitter_max_percent / 100)
+        return ttl + random.uniform(-jitter_range, jitter_range)
+
+    def _l2_operation(self, operation, *args, **kwargs):
+        """Execute L2 operation with health tracking."""
+        if not self.l2:
+            return None
+        if not self._l2_healthy:
+            return None
+        try:
+            result = operation(*args, **kwargs)
+            with self._lock:
+                self._l2_fail_count = 0
+            return result
+        except Exception:
+            with self._lock:
+                self._l2_fail_count += 1
+                if self._l2_fail_count >= self._l2_max_failures:
+                    self._l2_healthy = False
+            return None
+
+    def get(self, key: str) -> Optional[tuple[float, Any]]:
+        # Try L1 first
+        result = self.l1.get(key)
+        if result is not None:
+            return result
+
+        # Try L2
+        if self.l2 and self._l2_healthy:
+            result = self._l2_operation(self.l2.get, key)
+            if result is not None:
+                # Backfill L1
+                expire_time, value = result
+                remaining_ttl = expire_time - time.time()
+                if remaining_ttl > 0:
+                    self.l1.set(key, value, remaining_ttl)
+                return result
+
+        return None
+
+    def set(self, key: str, value: Any, ttl: float) -> None:
+        jittered_ttl = self._apply_jitter(ttl)
+        self.l1.set(key, value, jittered_ttl)
+        if self.l2:
+            self._l2_operation(self.l2.set, key, value, jittered_ttl)
+
+    def delete(self, key: str) -> None:
+        self.l1.delete(key)
+        if self.l2:
+            self._l2_operation(self.l2.delete, key)
+
+    def clear(self) -> None:
+        self.l1.clear()
+        if self.l2:
+            self._l2_operation(self.l2.clear)
+
+    def get_many(self, keys: List[str]) -> Dict[str, tuple[float, Any]]:
+        result = self.l1.get_many(keys)
+        remaining_keys = [k for k in keys if k not in result]
+        
+        if remaining_keys and self.l2 and self._l2_healthy:
+            l2_result = self._l2_operation(self.l2.get_many, remaining_keys)
+            if l2_result:
+                result.update(l2_result)
+                # Backfill L1
+                for key, (expire_time, value) in l2_result.items():
+                    remaining_ttl = expire_time - time.time()
+                    if remaining_ttl > 0:
+                        self.l1.set(key, value, remaining_ttl)
+        return result
+
+    def set_many(self, items: Dict[str, Any], ttl: float) -> None:
+        jittered_ttl = self._apply_jitter(ttl)
+        self.l1.set_many(items, jittered_ttl)
+        if self.l2:
+            self._l2_operation(self.l2.set_many, items, jittered_ttl)
+
+    def delete_many(self, keys: List[str]) -> None:
+        self.l1.delete_many(keys)
+        if self.l2:
+            self._l2_operation(self.l2.delete_many, keys)
+
+    def keys(self) -> List[str]:
+        l1_keys = set(self.l1.keys())
+        if self.l2 and self._l2_healthy:
+            l2_keys = set(self._l2_operation(self.l2.keys) or [])
+            return list(l1_keys | l2_keys)
+        return list(l1_keys)
+
+    def health(self) -> dict:
+        l1_health = self.l1.health()
+        l2_health = self.l2.health() if self.l2 else {"status": "none"}
+        return {
+            "status": "healthy" if l1_health["status"] == "healthy" else "degraded",
+            "type": "multi-tier",
+            "l1": l1_health,
+            "l2": l2_health,
+            "l2_healthy": self._l2_healthy,
+        }
+
+
 class CacheStats:
     """Track cache hit/miss statistics."""
 
@@ -606,6 +749,8 @@ def cache(
     stampede_protection: bool = False,
     background_refresh: Optional[float] = None,
     serializer: str = "pickle",
+    jitter: bool = False,
+    jitter_max_percent: int = 10,
 ):
     """
     Decorator that caches function results with TTL.
@@ -613,7 +758,7 @@ def cache(
     Args:
         ttl: Time-to-live in seconds, or shorthand like "1h", "30m", "7d".
         maxsize: Maximum number of cached items (memory backend only).
-        backend: Custom backend (MemoryBackend, DiskBackend, RedisBackend).
+        backend: Custom backend (MemoryBackend, DiskBackend, RedisBackend, MultiTierBackend).
         key_fn: Custom key function f(func, args, kwargs) -> str.
         prefix: Cache key prefix for namespacing.
         sliding: If True, TTL resets on each access (sliding window).
@@ -623,6 +768,8 @@ def cache(
         stampede_protection: Prevent cache stampede with locking.
         background_refresh: Seconds before expiry to trigger background refresh.
         serializer: Serialization format ("pickle", "json", "msgpack").
+        jitter: Enable TTL jitter to prevent thundering herd.
+        jitter_max_percent: Max jitter percentage (0-100).
 
     Usage:
         @cache(ttl="1h")

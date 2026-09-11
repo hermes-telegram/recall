@@ -914,3 +914,174 @@ class TestRedisBackend:
         assert result is not None
         assert result[1] == "value"
         be.clear()
+
+
+# ============================================================
+# MultiTier Backend Tests
+# ============================================================
+
+class TestMultiTierBackend:
+    def test_l1_l2_fallback(self):
+        """Test L1 miss → L2 hit → backfill L1."""
+        from recall import MultiTierBackend, MemoryBackend, DiskBackend
+        l1 = MemoryBackend()
+        l2 = DiskBackend(tempfile.mkdtemp())
+        
+        be = MultiTierBackend(l1=l1, l2=l2)
+        be.set("key1", "value1", ttl=60)
+        
+        # Clear L1 to simulate miss
+        l1.clear()
+        
+        # Should get from L2 and backfill L1
+        result = be.get("key1")
+        assert result is not None
+        assert result[1] == "value1"
+        
+        # L1 should be backfilled
+        l1_result = l1.get("key1")
+        assert l1_result is not None
+        assert l1_result[1] == "value1"
+
+    def test_l2_unavailable_fallback(self):
+        """Test graceful degradation when L2 is unavailable."""
+        from recall import MultiTierBackend, MemoryBackend
+        l1 = MemoryBackend()
+        
+        be = MultiTierBackend(l1=l1, l2=None)
+        be.set("key1", "value1", ttl=60)
+        
+        result = be.get("key1")
+        assert result is not None
+        assert result[1] == "value1"
+
+    def test_jitter(self):
+        """Test TTL jitter."""
+        from recall import MultiTierBackend, MemoryBackend
+        l1 = MemoryBackend()
+        
+        be = MultiTierBackend(l1=l1, jitter=True, jitter_max_percent=10)
+        be.set("key1", "value1", ttl=60)
+        
+        result = be.get("key1")
+        assert result is not None
+        assert result[1] == "value1"
+
+    def test_delete(self):
+        from recall import MultiTierBackend, MemoryBackend, DiskBackend
+        l1 = MemoryBackend()
+        l2 = DiskBackend(tempfile.mkdtemp())
+        
+        be = MultiTierBackend(l1=l1, l2=l2)
+        be.set("key1", "value1", ttl=60)
+        be.delete("key1")
+        
+        assert be.get("key1") is None
+
+    def test_clear(self):
+        from recall import MultiTierBackend, MemoryBackend, DiskBackend
+        l1 = MemoryBackend()
+        l2 = DiskBackend(tempfile.mkdtemp())
+        
+        be = MultiTierBackend(l1=l1, l2=l2)
+        be.set("key1", "value1", ttl=60)
+        be.set("key2", "value2", ttl=60)
+        be.clear()
+        
+        assert be.get("key1") is None
+        assert be.get("key2") is None
+
+    def test_health(self):
+        from recall import MultiTierBackend, MemoryBackend
+        l1 = MemoryBackend()
+        
+        be = MultiTierBackend(l1=l1)
+        health = be.health()
+        assert health["type"] == "multi-tier"
+        assert health["status"] == "healthy"
+
+    def test_get_many(self):
+        from recall import MultiTierBackend, MemoryBackend, DiskBackend
+        l1 = MemoryBackend()
+        l2 = DiskBackend(tempfile.mkdtemp())
+        
+        be = MultiTierBackend(l1=l1, l2=l2)
+        be.set_many({"k1": "v1", "k2": "v2"}, ttl=60)
+        
+        results = be.get_many(["k1", "k2"])
+        assert "k1" in results
+        assert "k2" in results
+
+    def test_set_many(self):
+        from recall import MultiTierBackend, MemoryBackend, DiskBackend
+        l1 = MemoryBackend()
+        l2 = DiskBackend(tempfile.mkdtemp())
+        
+        be = MultiTierBackend(l1=l1, l2=l2)
+        be.set_many({"k1": "v1", "k2": "v2"}, ttl=60)
+        
+        assert be.get("k1")[1] == "v1"
+        assert be.get("k2")[1] == "v2"
+
+
+# ============================================================
+# Disk Encryption Tests
+# ============================================================
+
+class TestDiskEncryption:
+    def setup_method(self):
+        self.dir = tempfile.mkdtemp()
+
+    def teardown_method(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_encrypted_data(self):
+        """Test that data is actually encrypted on disk."""
+        be = DiskBackend(self.dir, encryption_key="my-secret-key")
+        be.set("key1", "sensitive-data", ttl=60)
+        
+        # Read raw file - should be encrypted
+        files = [f for f in os.listdir(self.dir) if f.endswith(".cache")]
+        assert len(files) == 1
+        
+        with open(os.path.join(self.dir, files[0]), "rb") as f:
+            raw = f.read()
+            # Should not be readable as plain text
+            assert b"sensitive-data" not in raw
+
+    def test_decryption(self):
+        """Test that encrypted data can be decrypted."""
+        be = DiskBackend(self.dir, encryption_key="my-secret-key")
+        be.set("key1", "sensitive-data", ttl=60)
+        
+        result = be.get("key1")
+        assert result is not None
+        assert result[1] == "sensitive-data"
+
+    def test_wrong_key_fails(self):
+        """Test that wrong key cannot decrypt."""
+        be1 = DiskBackend(self.dir, encryption_key="key1")
+        be1.set("key1", "data", ttl=60)
+        
+        # Different key should not be able to decrypt
+        be2 = DiskBackend(self.dir, encryption_key="key2")
+        result = be2.get("key1")
+        assert result is None
+
+    def test_no_encryption(self):
+        """Test that without key, data is stored plain."""
+        be = DiskBackend(self.dir)
+        be.set("key1", "plain-data", ttl=60)
+        
+        result = be.get("key1")
+        assert result is not None
+        assert result[1] == "plain-data"
+
+    def test_encrypted_keys(self):
+        """Test keys() with encryption."""
+        be = DiskBackend(self.dir, encryption_key="my-secret-key")
+        be.set("k1", "v1", ttl=60)
+        be.set("k2", "v2", ttl=60)
+        
+        keys = be.keys()
+        assert len(keys) == 2
