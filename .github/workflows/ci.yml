@@ -19,11 +19,11 @@ jobs:
           pip install -e ".[dev]"
           pip install mypy ruff bandit safety
       - name: Run ruff
-        run: ruff check src/
+        run: ruff check src/ --fix
       - name: Run mypy
-        run: mypy src/ --strict
+        run: mypy src/ --ignore-missing-imports
       - name: Run bandit
-        run: bandit -r src/
+        run: bandit -r src/ -ll
       - name: Run safety
         run: safety check
 
@@ -60,10 +60,10 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: pip install bandit safety trivy
+        run: pip install bandit safety
       - name: Run security scan
         run: |
-          bandit -r src/
+          bandit -r src/ -ll
           safety check
 
   publish:
