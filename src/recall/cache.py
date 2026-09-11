@@ -1,6 +1,7 @@
 """Core cache decorator and backends for recall."""
 
 import asyncio
+import atexit
 import base64
 import functools
 import hashlib
@@ -69,15 +70,16 @@ class CacheBackend(ABC):
 class MemoryBackend(CacheBackend):
     """In-memory cache with TTL and maxsize (LRU eviction)."""
 
-    def __init__(self, maxsize: int = 1000, compression: bool = False):
+    def __init__(self, maxsize: int = 1000, compression: bool = False, compression_level: int = 6):
         self._cache: dict[str, tuple[float, Any]] = {}
         self._access: dict[str, float] = {}
         self.maxsize = maxsize
         self.compression = compression
+        self.compression_level = compression_level
         self._lock = threading.Lock()
 
     def _compress(self, value: Any) -> bytes:
-        return zlib.compress(pickle.dumps(value))
+        return zlib.compress(pickle.dumps(value), self.compression_level)
 
     def _decompress(self, data: bytes) -> Any:
         return pickle.loads(zlib.decompress(data))
@@ -160,15 +162,27 @@ class DiskBackend(CacheBackend):
         self,
         directory: str = ".recall_cache",
         compression: bool = False,
+        compression_level: int = 6,
         max_size_bytes: Optional[int] = None,
         encryption_key: Optional[str] = None,
+        async_mode: bool = False,
+        cleanup_interval: int = 60,
     ):
         self.directory = directory
         self.compression = compression
+        self.compression_level = compression_level
         self.max_size_bytes = max_size_bytes
         self._lock = threading.Lock()
         self.encryption_key = encryption_key
+        self.async_mode = async_mode
+        self.cleanup_interval = cleanup_interval
         os.makedirs(directory, exist_ok=True)
+        
+        # Background cleanup
+        self._cleanup_thread = None
+        self._cleanup_running = False
+        if cleanup_interval > 0:
+            self._start_cleanup_thread()
 
     def _path(self, key: str) -> str:
         safe = hashlib.sha256(key.encode()).hexdigest()[:16]
@@ -222,7 +236,7 @@ class DiskBackend(CacheBackend):
         with self._lock:
             path = self._path(key)
             if self.compression:
-                data = pickle.dumps((time.time() + ttl, zlib.compress(pickle.dumps(value))))
+                data = pickle.dumps((time.time() + ttl, zlib.compress(pickle.dumps(value), self.compression_level)))
             else:
                 data = pickle.dumps((time.time() + ttl, value))
             with open(path, "wb") as f:
@@ -326,6 +340,45 @@ class DiskBackend(CacheBackend):
                 os.remove(meta)
             total -= size
 
+    def _start_cleanup_thread(self):
+        """Start background cleanup thread."""
+        if self._cleanup_thread and self._cleanup_thread.is_alive():
+            return
+        self._cleanup_running = True
+        self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
+        self._cleanup_thread.start()
+
+    def _cleanup_loop(self):
+        """Background cleanup loop."""
+        while self._cleanup_running:
+            time.sleep(self.cleanup_interval)
+            self._cleanup_expired()
+
+    def _cleanup_expired(self):
+        """Remove expired files."""
+        with self._lock:
+            now = time.time()
+            for f in os.listdir(self.directory):
+                if f.endswith(".cache"):
+                    path = os.path.join(self.directory, f)
+                    try:
+                        with open(path, "rb") as fh:
+                            raw = self._decrypt(fh.read())
+                            expire_time, _ = pickle.loads(raw)
+                        if expire_time <= now:
+                            os.remove(path)
+                            meta = path.replace(".cache", ".meta")
+                            if os.path.exists(meta):
+                                os.remove(meta)
+                    except:
+                        pass
+
+    def shutdown(self):
+        """Graceful shutdown."""
+        self._cleanup_running = False
+        if self._cleanup_thread:
+            self._cleanup_thread.join(timeout=5)
+
 
 class RedisBackend(CacheBackend):
     """Redis cache backend — full-featured with connection pooling, retry, cluster support."""
@@ -335,6 +388,7 @@ class RedisBackend(CacheBackend):
         url: str = "redis://localhost:6379",
         prefix: str = "recall:",
         compression: bool = False,
+        compression_level: int = 6,
         max_connections: int = 10,
         socket_timeout: float = 5.0,
         socket_connect_timeout: float = 5.0,
@@ -348,6 +402,7 @@ class RedisBackend(CacheBackend):
     ):
         self.prefix = prefix
         self.compression = compression
+        self.compression_level = compression_level
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.serializer = serializer
@@ -427,7 +482,7 @@ class RedisBackend(CacheBackend):
     def set(self, key: str, value: Any, ttl: float) -> None:
         expire_time = time.time() + ttl
         if self.compression:
-            data = self._serialize((expire_time, zlib.compress(self._serialize(value))))
+            data = self._serialize((expire_time, zlib.compress(self._serialize(value), self.compression_level)))
         else:
             data = self._serialize((expire_time, value))
         self._execute_with_retry(self.client.set, self._key(key), data, ex=int(ttl))
@@ -470,7 +525,7 @@ class RedisBackend(CacheBackend):
             pipe = self.client.pipeline()
             for key, value in items.items():
                 if self.compression:
-                    data = self._serialize((time.time() + ttl, zlib.compress(self._serialize(value))))
+                    data = self._serialize((time.time() + ttl, zlib.compress(self._serialize(value), self.compression_level)))
                 else:
                     data = self._serialize((time.time() + ttl, value))
                 pipe.set(self._key(key), data, ex=int(ttl))
@@ -540,6 +595,13 @@ class RedisBackend(CacheBackend):
         except Exception as e:
             return {"status": "unhealthy", "type": "redis", "error": str(e)}
 
+    def shutdown(self):
+        """Graceful shutdown."""
+        try:
+            self.client.close()
+        except:
+            pass
+
 
 class MultiTierBackend(CacheBackend):
     """
@@ -556,13 +618,6 @@ class MultiTierBackend(CacheBackend):
         jitter: bool = False,
         jitter_max_percent: int = 10,
     ):
-        """
-        Args:
-            l1: L1 cache (Memory)
-            l2: L2 cache (Disk or Redis)
-            jitter: Enable TTL jitter to prevent thundering herd
-            jitter_max_percent: Max jitter percentage (0-100)
-        """
         self.l1 = l1 or MemoryBackend()
         self.l2 = l2
         self.jitter = jitter
@@ -677,6 +732,13 @@ class MultiTierBackend(CacheBackend):
             "l2_healthy": self._l2_healthy,
         }
 
+    def shutdown(self):
+        """Graceful shutdown."""
+        if hasattr(self.l2, 'shutdown'):
+            self.l2.shutdown()
+        if hasattr(self.l1, 'shutdown'):
+            self.l1.shutdown()
+
 
 class CacheStats:
     """Track cache hit/miss statistics."""
@@ -746,11 +808,13 @@ def cache(
     version: Optional[str] = None,
     on_evict: Optional[Callable] = None,
     compression: bool = False,
+    compression_level: int = 6,
     stampede_protection: bool = False,
     background_refresh: Optional[float] = None,
     serializer: str = "pickle",
     jitter: bool = False,
     jitter_max_percent: int = 10,
+    condition: Optional[Callable] = None,
 ):
     """
     Decorator that caches function results with TTL.
@@ -765,11 +829,13 @@ def cache(
         version: Cache version — change to invalidate all cached values.
         on_evict: Callback f(key, value) called when item is evicted.
         compression: Compress cached values (zlib).
+        compression_level: Compression level (1-9 for zlib).
         stampede_protection: Prevent cache stampede with locking.
         background_refresh: Seconds before expiry to trigger background refresh.
         serializer: Serialization format ("pickle", "json", "msgpack").
         jitter: Enable TTL jitter to prevent thundering herd.
         jitter_max_percent: Max jitter percentage (0-100).
+        condition: Conditional caching f(result) -> bool.
 
     Usage:
         @cache(ttl="1h")
@@ -786,7 +852,7 @@ def cache(
         ttl = float(ttl[:-1]) * multipliers.get(ttl[-1].lower(), 1)
 
     if backend is None:
-        backend = MemoryBackend(maxsize=maxsize, compression=compression)
+        backend = MemoryBackend(maxsize=maxsize, compression=compression, compression_level=compression_level)
 
     stats = CacheStats()
     _lock = threading.Lock()
@@ -891,7 +957,10 @@ def cache(
 
                 stats.miss()
                 value = await func(*args, **kwargs)
-                backend.set(key, value, ttl)
+                
+                # Conditional caching
+                if condition is None or condition(value):
+                    backend.set(key, value, ttl)
                 return value
 
             def cache_clear():
@@ -956,7 +1025,10 @@ def cache(
 
             stats.miss()
             value = func(*args, **kwargs)
-            backend.set(key, value, ttl)
+            
+            # Conditional caching
+            if condition is None or condition(value):
+                backend.set(key, value, ttl)
             return value
 
         def cache_clear():
