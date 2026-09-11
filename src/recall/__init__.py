@@ -11,7 +11,7 @@ from .cache import (
 )
 
 # Admin Panel
-from .admin import AdminPanel, start_admin
+from .admin import AdminPanel, start_admin, RBACManager
 
 # Metrics
 from .metrics import MetricsCollector
@@ -48,6 +48,9 @@ from .tenant import TenantManager, TenantBackend
 
 # Cache Warming
 from .warming import WarmingScheduler
+
+# Migration
+from .migrate import MigrationTool, ConfigMigrator, DataMigrator
 
 # Plugins
 from .plugins import FastAPICache
@@ -86,6 +89,7 @@ __all__ = [
     "CacheStats",
     "AdminPanel",
     "start_admin",
+    "RBACManager",
     "MetricsCollector",
     "StructuredLogger",
     "get_logger",
@@ -101,6 +105,9 @@ __all__ = [
     "TenantManager",
     "TenantBackend",
     "WarmingScheduler",
+    "MigrationTool",
+    "ConfigMigrator",
+    "DataMigrator",
     "FastAPICache",
     "RequestCoalescer",
     "ProbabilisticEarlyExpiration",
@@ -123,4 +130,4 @@ __all__ = [
     "RequestDeduplication",
     "CacheEfficiencyTracker",
 ]
-__version__ = "3.0.0"
+__version__ = "3.1.0"

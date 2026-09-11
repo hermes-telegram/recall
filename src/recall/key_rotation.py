@@ -47,7 +47,7 @@ class KeyRotator:
         rotated = 0
         
         for key in keys:
-            # Decrypt with old key
+            # Temporarily set old key for decryption
             self.backend.encryption_key = self.old_key
             result = self.backend.get(key)
             
@@ -56,7 +56,7 @@ class KeyRotator:
                 remaining_ttl = expire_time - time.time()
                 
                 if remaining_ttl > 0:
-                    # Re-encrypt with new key
+                    # Set new key for re-encryption
                     self.backend.encryption_key = self.new_key
                     self.backend.set(key, value, remaining_ttl)
                     rotated += 1
