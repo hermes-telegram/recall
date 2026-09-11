@@ -9,6 +9,13 @@ import threading
 import pytest
 from recall import cache, MemoryBackend, DiskBackend, CacheStats
 
+# Check if redis is available
+try:
+    import redis
+    HAS_REDIS = True
+except ImportError:
+    HAS_REDIS = False
+
 
 # ============================================================
 # Memory Backend Tests
@@ -793,3 +800,117 @@ class TestIntegration:
         assert len(data) == 1000
         data2 = get_large()
         assert data == data2
+
+
+# ============================================================
+# Redis Tests (only if redis is available)
+# ============================================================
+
+@pytest.mark.skipif(not HAS_REDIS, reason="Redis not installed")
+class TestRedisBackend:
+    def setup_method(self):
+        from recall import RedisBackend
+        self.backend = RedisBackend("redis://localhost:6379", prefix="test:")
+
+    def teardown_method(self):
+        self.backend.clear()
+
+    def test_set_and_get(self):
+        self.backend.set("key1", "value1", ttl=60)
+        result = self.backend.get("key1")
+        assert result is not None
+        assert result[1] == "value1"
+
+    def test_get_missing(self):
+        assert self.backend.get("nonexistent") is None
+
+    def test_expiration(self):
+        self.backend.set("key1", "value1", ttl=1)
+        time.sleep(1.5)
+        assert self.backend.get("key1") is None
+
+    def test_delete(self):
+        self.backend.set("key1", "value1", ttl=60)
+        self.backend.delete("key1")
+        assert self.backend.get("key1") is None
+
+    def test_clear(self):
+        self.backend.set("k1", "v1", ttl=60)
+        self.backend.set("k2", "v2", ttl=60)
+        self.backend.clear()
+        assert self.backend.get("k1") is None
+        assert self.backend.get("k2") is None
+
+    def test_compression(self):
+        from recall import RedisBackend
+        be = RedisBackend("redis://localhost:6379", prefix="test:", compression=True)
+        be.set("key1", "value1", ttl=60)
+        result = be.get("key1")
+        assert result is not None
+        assert result[1] == "value1"
+        be.clear()
+
+    def test_get_many(self):
+        self.backend.set("k1", "v1", ttl=60)
+        self.backend.set("k2", "v2", ttl=60)
+        results = self.backend.get_many(["k1", "k2"])
+        assert "k1" in results
+        assert "k2" in results
+
+    def test_set_many(self):
+        self.backend.set_many({"k1": "v1", "k2": "v2"}, ttl=60)
+        assert self.backend.get("k1")[1] == "v1"
+        assert self.backend.get("k2")[1] == "v2"
+
+    def test_delete_many(self):
+        self.backend.set("k1", "v1", ttl=60)
+        self.backend.set("k2", "v2", ttl=60)
+        self.backend.delete_many(["k1", "k2"])
+        assert self.backend.get("k1") is None
+        assert self.backend.get("k2") is None
+
+    def test_keys(self):
+        self.backend.set("k1", "v1", ttl=60)
+        self.backend.set("k2", "v2", ttl=60)
+        keys = self.backend.keys()
+        assert len(keys) == 2
+
+    def test_exists(self):
+        self.backend.set("key1", "value1", ttl=60)
+        assert self.backend.exists("key1") is True
+        assert self.backend.exists("nonexistent") is False
+
+    def test_ttl(self):
+        self.backend.set("key1", "value1", ttl=60)
+        remaining = self.backend.ttl("key1")
+        assert remaining is not None
+        assert remaining > 0
+
+    def test_touch(self):
+        self.backend.set("key1", "value1", ttl=60)
+        assert self.backend.touch("key1", 120) is True
+        assert self.backend.touch("nonexistent", 120) is False
+
+    def test_health(self):
+        health = self.backend.health()
+        assert health["status"] == "healthy"
+        assert health["type"] == "redis"
+
+    def test_serializer_json(self):
+        from recall import RedisBackend
+        be = RedisBackend("redis://localhost:6379", prefix="test:", serializer="json")
+        be.set("key1", {"a": 1}, ttl=60)
+        result = be.get("key1")
+        assert result is not None
+        assert result[1] == {"a": 1}
+        be.clear()
+
+    def test_key_hash(self):
+        from recall import RedisBackend
+        be = RedisBackend("redis://localhost:6379", prefix="test:", key_hash=True)
+        long_key = "x" * 300
+        be.set(long_key, "value", ttl=60)
+        result = be.get(long_key)
+        assert result is not None
+        assert result[1] == "value"
+        be.clear()

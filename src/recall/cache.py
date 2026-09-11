@@ -302,7 +302,7 @@ class DiskBackend(CacheBackend):
 
 
 class RedisBackend(CacheBackend):
-    """Redis cache backend with connection pooling and retry logic."""
+    """Redis cache backend — full-featured with connection pooling, retry, cluster support."""
 
     def __init__(
         self,
@@ -315,24 +315,57 @@ class RedisBackend(CacheBackend):
         retry_on_timeout: bool = True,
         max_retries: int = 3,
         retry_delay: float = 0.1,
+        serializer: str = "pickle",
+        key_hash: bool = False,
+        db: int = 0,
+        cluster_mode: bool = False,
     ):
-        import redis
-        from redis.connection import ConnectionPool
+        """
+        Initialize Redis backend.
 
+        Args:
+            url: Redis URL (redis://, rediss://, unix://)
+            prefix: Key prefix for namespacing
+            compression: Compress values with zlib
+            max_connections: Max connections in pool
+            socket_timeout: Socket timeout in seconds
+            socket_connect_timeout: Connection timeout in seconds
+            retry_on_timeout: Retry on timeout errors
+            max_retries: Max retry attempts
+            retry_delay: Initial retry delay (exponential backoff)
+            serializer: Serialization format (pickle, json, msgpack)
+            key_hash: Hash long keys with SHA256
+            db: Redis database number (standalone only)
+            cluster_mode: Enable Redis Cluster mode
+        """
         self.prefix = prefix
         self.compression = compression
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.serializer = serializer
+        self.key_hash = key_hash
 
-        pool = ConnectionPool.from_url(
-            url,
-            max_connections=max_connections,
-            socket_timeout=socket_timeout,
-            socket_connect_timeout=socket_connect_timeout,
-            retry_on_timeout=retry_on_timeout,
-        )
-        self.client = redis.Redis(connection_pool=pool)
+        if cluster_mode:
+            from rediscluster import RedisCluster
+
+            startup_nodes = [{"host": url.split(":")[1].split("@")[-1], "port": int(url.split(":")[-1].split("/")[0])}]
+            self.client = RedisCluster(startup_nodes=startup_nodes, decode_responses=False)
+        else:
+            import redis
+            from redis.connection import ConnectionPool
+
+            pool = ConnectionPool.from_url(
+                url,
+                max_connections=max_connections,
+                socket_timeout=socket_timeout,
+                socket_connect_timeout=socket_connect_timeout,
+                retry_on_timeout=retry_on_timeout,
+                db=db,
+            )
+            self.client = redis.Redis(connection_pool=pool)
+
         self._lock = threading.Lock()
+        self._init_serializer()
 
         # Test connection
         try:
@@ -340,8 +373,25 @@ class RedisBackend(CacheBackend):
         except Exception as e:
             raise ConnectionError(f"Redis connection failed: {e}")
 
+    def _init_serializer(self):
+        """Initialize serializer functions."""
+        if self.serializer == "json":
+            self._serialize = lambda v: json.dumps(v).encode()
+            self._deserialize = lambda v: json.loads(v.decode())
+        elif self.serializer == "msgpack":
+            import msgpack
+            self._serialize = lambda v: msgpack.packb(v)
+            self._deserialize = lambda v: msgpack.unpackb(v)
+        else:
+            self._serialize = pickle.dumps
+            self._deserialize = pickle.loads
+
     def _key(self, key: str) -> str:
-        return f"{self.prefix}{key}"
+        full_key = f"{self.prefix}{key}"
+        if self.key_hash and len(full_key) > 250:
+            hashed = hashlib.sha256(full_key.encode()).hexdigest()[:16]
+            return f"{self.prefix}hash:{hashed}"
+        return full_key
 
     def _execute_with_retry(self, func, *args, **kwargs):
         """Execute Redis operation with retry logic."""
@@ -360,31 +410,35 @@ class RedisBackend(CacheBackend):
         try:
             raw = self._execute_with_retry(self.client.get, self._key(key))
             if raw:
-                data = pickle.loads(raw)
+                data = self._deserialize(raw)
                 if self.compression:
-                    return (data[0], pickle.loads(zlib.decompress(data[1])))
+                    return (data[0], self._deserialize(zlib.decompress(data[1])))
                 return data
         except Exception:
             pass
         return None
 
     def set(self, key: str, value: Any, ttl: float) -> None:
+        expire_time = time.time() + ttl
         if self.compression:
-            data = pickle.dumps((time.time() + ttl, zlib.compress(pickle.dumps(value))))
+            data = self._serialize((expire_time, zlib.compress(self._serialize(value))))
         else:
-            data = pickle.dumps((time.time() + ttl, value))
-        self._execute_with_retry(self.client.setex, self._key(key), int(ttl), data)
+            data = self._serialize((expire_time, value))
+        self._execute_with_retry(self.client.set, self._key(key), data, ex=int(ttl))
 
     def delete(self, key: str) -> None:
         self._execute_with_retry(self.client.delete, self._key(key))
 
     def clear(self) -> None:
-        """Clear using SCAN to avoid blocking Redis."""
+        """Clear using SCAN + pipeline to avoid blocking Redis."""
         cursor = 0
         while True:
             cursor, keys = self.client.scan(cursor, match=f"{self.prefix}*", count=100)
             if keys:
-                self._execute_with_retry(self.client.delete, *keys)
+                pipe = self.client.pipeline()
+                for k in keys:
+                    pipe.delete(k)
+                self._execute_with_retry(pipe.execute)
             if cursor == 0:
                 break
 
@@ -398,7 +452,7 @@ class RedisBackend(CacheBackend):
             results = {}
             for key, raw in zip(keys, pipe.execute()):
                 if raw:
-                    results[key] = pickle.loads(raw)
+                    results[key] = self._deserialize(raw)
             return results
         except Exception:
             return {}
@@ -410,11 +464,11 @@ class RedisBackend(CacheBackend):
             pipe = self.client.pipeline()
             for key, value in items.items():
                 if self.compression:
-                    data = pickle.dumps((time.time() + ttl, zlib.compress(pickle.dumps(value))))
+                    data = self._serialize((time.time() + ttl, zlib.compress(self._serialize(value))))
                 else:
-                    data = pickle.dumps((time.time() + ttl, value))
-                pipe.setex(self._key(key), int(ttl), data)
-            pipe.execute()
+                    data = self._serialize((time.time() + ttl, value))
+                pipe.set(self._key(key), data, ex=int(ttl))
+            self._execute_with_retry(pipe.execute)
         except Exception:
             pass
 
@@ -425,7 +479,7 @@ class RedisBackend(CacheBackend):
             pipe = self.client.pipeline()
             for key in keys:
                 pipe.delete(self._key(key))
-            pipe.execute()
+            self._execute_with_retry(pipe.execute)
         except Exception:
             pass
 
@@ -442,6 +496,30 @@ class RedisBackend(CacheBackend):
         except Exception:
             pass
         return result
+
+    def exists(self, key: str) -> bool:
+        """Check if key exists."""
+        try:
+            return bool(self._execute_with_retry(self.client.exists, self._key(key)))
+        except Exception:
+            return False
+
+    def touch(self, key: str, ttl: float) -> bool:
+        """Update TTL without changing value."""
+        try:
+            return bool(self._execute_with_retry(self.client.expire, self._key(key), int(ttl)))
+        except Exception:
+            return False
+
+    def ttl(self, key: str) -> Optional[float]:
+        """Get remaining TTL in seconds."""
+        try:
+            remaining = self._execute_with_retry(self.client.ttl, self._key(key))
+            if remaining > 0:
+                return float(remaining)
+            return None
+        except Exception:
+            return None
 
     def health(self) -> dict:
         try:
