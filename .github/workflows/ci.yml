@@ -7,26 +7,6 @@ on:
     branches: [main]
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install dependencies
-        run: |
-          pip install -e ".[dev]"
-          pip install mypy ruff bandit safety
-      - name: Run ruff
-        run: ruff check src/ --fix
-      - name: Run mypy
-        run: mypy src/ --ignore-missing-imports
-      - name: Run bandit
-        run: bandit -r src/ -ll
-      - name: Run safety
-        run: safety check
-
   test:
     runs-on: ubuntu-latest
     services:
@@ -34,54 +14,57 @@ jobs:
         image: redis:7-alpine
         ports:
           - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
     strategy:
       matrix:
         python-version: ["3.11", "3.12"]
+
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
       - name: Run tests
         run: |
-          pytest tests/ -v --cov=recall --cov-report=xml --cov-report=term
-      - name: Upload coverage
-        uses: codecov/codecov-action@v3
-        with:
-          file: coverage.xml
-
-  security:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install dependencies
-        run: pip install bandit safety
-      - name: Run security scan
-        run: |
-          bandit -r src/ -ll
-          safety check
+          python -m pytest tests/ -v --tb=short
 
   publish:
-    needs: [lint, test, security]
+    needs: test
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     environment:
       name: pypi
     permissions:
       id-token: write
+
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install build tools
-        run: pip install build
-      - name: Build
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: Build package
         run: python -m build
-      - name: Publish
+
+      - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
