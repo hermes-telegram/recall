@@ -28,4 +28,3 @@ ENV/
 env/
 .cache/
 *.cache
-.github/
